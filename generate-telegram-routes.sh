@@ -14,16 +14,16 @@ curl -s "$URL" \
 
 {
   echo "/ip route"
-  echo ":foreach i in=[find where comment~\"telegram-ip\"] do={ remove \$i }"
+  echo ":foreach i in=[find where comment~\"telegram\"] do={ remove \$i }"
   COUNT4=0
   while read -r ip; do
     COUNT4=$((COUNT4 + 1))
-    echo "add comment=telegram-ip-${COUNT4} disabled=no distance=1 dst-address=${ip} gateway=${GATEWAY4} routing-table=${TABLE} scope=30 target-scope=10"
+    echo "add comment=ipv4-telegram-${COUNT4} disabled=no distance=1 dst-address=${ip} gateway=${GATEWAY4} routing-table=${TABLE} scope=30 target-scope=10"
   done < iplist4.txt
 
   echo ""
   echo "/ipv6 route"
-  echo ":foreach i in=[find where comment~\"ipv6-telegram\"] do={ remove \$i }"
+  echo ":foreach i in=[find where comment~\"telegram\"] do={ remove \$i }"
   COUNT6=0
   while read -r ip6; do
     COUNT6=$((COUNT6 + 1))
