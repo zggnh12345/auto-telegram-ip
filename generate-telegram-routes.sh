@@ -50,6 +50,7 @@ echo "$IP_LIST" | grep ':' > iplist6.txt
 ########################################
 {
   echo "/ip firewall address-list"
+  echo ":foreach i in=[find where comment~\"telegram\"] do={ remove \$i }"
   COUNT4=0
   while read -r ip; do
     [[ -z "$ip" ]] && continue
@@ -59,6 +60,7 @@ echo "$IP_LIST" | grep ':' > iplist6.txt
 
   echo ""
   echo "/ipv6 firewall address-list"
+  echo ":foreach i in=[find where comment~\"telegram\"] do={ remove \$i }"
   COUNT6=0
   while read -r ip6; do
     [[ -z "$ip6" ]] && continue
