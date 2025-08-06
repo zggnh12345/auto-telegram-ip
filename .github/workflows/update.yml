@@ -2,7 +2,7 @@ name: Update Telegram IP Routes (IPv4 & IPv6)
 
 on:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 1 * * *' 
   workflow_dispatch:
 
 jobs:
@@ -18,10 +18,19 @@ jobs:
           chmod +x ./generate-telegram-routes.sh
           ./generate-telegram-routes.sh
 
-      - name: Commit and Push Changes
+      - name: Commit and Push Updated RSC Files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add routeros-telegram-routes.rsc
-          git commit -m "Update routes [CI]" || echo "No changes"
-          git push
+
+          # 添加两个 .rsc 文件
+          git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
+
+          # 如果有改动就提交，否则跳过
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 自动更新 Telegram IP 路由和地址列表 [CI]"
+            git push
+          else
+            echo "No changes in RSC files. Skipping commit."
+          fi
+
