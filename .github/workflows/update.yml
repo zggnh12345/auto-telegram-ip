@@ -2,37 +2,53 @@ name: Update Telegram IP Routes (IPv4 & IPv6)
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 每天 UTC 时间 1:00 运行
-  workflow_dispatch:      # 允许手动触发
+    - cron: '0 1 * * *'    # 每天 01:00 UTC
+    - cron: '0 1 1 * *'    # 每月 1 号 01:00 UTC（强制更新）
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 0  # 获取完整历史记录
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Generate Route Script
-      run: |
-        chmod +x ./generate-telegram-routes.sh
-        ./generate-telegram-routes.sh
+      - name: Generate Route Script
+        run: |
+          chmod +x ./generate-telegram-routes.sh
+          ./generate-telegram-routes.sh
 
-    - name: Commit and Push Updated RSC Files
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        
-        # 检查文件是否有实际变化
-        if git status --porcelain | grep -E 'routeros-telegram-(routes|addresslist)\.rsc'; then
+      - name: Commit and Push Updated RSC Files (force regenerate on 1st)
+        env:
+          GIT_USER_NAME: "github-actions[bot]"
+          GIT_USER_EMAIL: "github-actions[bot]@users.noreply.github.com"
+          REPO_URL: "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+        run: |
+          set -e
+
+          git config user.name "${GIT_USER_NAME}"
+          git config user.email "${GIT_USER_EMAIL}"
+
+          # 每月1号强制修改文件，让git检测为变化
+          if [ "$(date +'%d')" = "01" ]; then
+            echo "Forcing refresh on 1st of month..."
+            # 改变文件时间戳或附加标记注释
+            echo "# Forced monthly regeneration at $(date -u)" >> routeros-telegram-routes.rsc
+            echo "# Forced monthly regeneration at $(date -u)" >> routeros-telegram-addresslist.rsc
+          fi
+
           git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
-          git commit -m "🤖 自动更新 Telegram IP 路由和地址列表 [skip ci]"
-          git push
-          echo "Changes detected and pushed successfully."
-        else
-          echo "No changes in RSC files. Skipping commit."
-        fi
 
+          # 检查是否有改动（包括强制改动）
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 自动更新 Telegram IP 路由和地址列表 [CI]"
+            git push "${REPO_URL}"
+          else
+            echo "No changes detected, skipping commit."
+          fi
