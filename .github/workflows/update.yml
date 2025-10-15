@@ -21,23 +21,31 @@ jobs:
 
     - name: Commit and Push Updated RSC Files
       run: |
+        set -euo pipefail
+
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
-        
-        # 检查是否是每月1号的强制更新
-        if [ "$(date +%d)" = "01" ]; then
-          git commit -m "🤖 每月强制更新 Telegram IP 路由和地址列表"
+
+        # 暂存目标文件（若不存在也不会中断）
+        git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
+
+        # 若是每月1号（UTC），则保证有一次提交：先尝试正常提交（若有变更），否则强制空提交；非1号则只在有变更时提交
+        if [ "$(date -u +%d)" = "01" ]; then
+          echo "Today is 1st of month (UTC): ensuring a commit (normal or --allow-empty)..."
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 每月强制更新 Telegram IP 路由和地址列表 (files changed)"
+          else
+            git commit --allow-empty -m "🤖 每月保活提交 [keep-alive] $(date -u +%Y-%m-%d) [ci skip]"
+          fi
           git push
-          echo "Monthly forced update completed."
+          echo "Monthly forced update / keep-alive pushed."
         else
-          # 日常更新，只在有变化时提交
+          # 非 1 号：仅在有文件变更时提交并推送
           if ! git diff --cached --quiet; then
             git commit -m "🤖 自动更新 Telegram IP 路由和地址列表"
             git push
-            echo "Daily update with changes completed."
+            echo "Daily update with changes pushed."
           else
             echo "No changes in RSC files. Skipping commit."
           fi
         fi
-
