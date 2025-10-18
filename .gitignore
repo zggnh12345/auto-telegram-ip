@@ -1,0 +1,20 @@
+# Shell history
+.ash_history
+.bash_history
+.history
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Backup files
+*.bak
+*.orig
+
+# macOS metadata
+.DS_Store
