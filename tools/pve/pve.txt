@@ -1,0 +1,970 @@
+#!/bin/bash
+set -e
+
+# 颜色定义
+readonly GREEN='\e[32m'
+readonly RED='\e[31m'
+readonly YELLOW='\e[33m'
+readonly WHITE='\e[97m'
+readonly NC='\e[0m'
+readonly CYAN='\e[36m'
+
+# 输出函数
+info_start() { echo -e "${GREEN}▶  $1${NC}"; }
+info_end()   { echo -e "${GREEN}■  $1${NC}"; }
+note()       { echo -e "${WHITE}✓  $1${NC}"; }
+warn()       { echo -e "${YELLOW}!  $1${NC}"; }
+error()      { echo -e "${RED}✗  $1${NC}"; }
+
+# 备份目录
+readonly BACKUP_ROOT="/var/backups/pve-setup"
+
+# 备份文件列表
+readonly FILES_TO_BACKUP=(
+  "/etc/apt/sources.list.d/debian.sources"
+  "/etc/apt/sources.list.d/pve-no-subscription.sources"
+  "/etc/apt/sources.list.d/pve-ceph-no-subscription.sources"
+  "/usr/share/perl5/PVE/APLInfo.pm"
+  "/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+  "/usr/share/pve-manager/js/pvemanagerlib.js"
+  "/etc/chrony/chrony.conf"
+  "/etc/default/grub"
+  "/etc/network/interfaces"
+  "/etc/udev/rules.d/70-persistent-net.rules"
+  "/etc/fstab"
+  "/etc/modules-load.d/10-vfio-modules.conf"
+  "/etc/default/cpupower"
+  "/etc/systemd/system/cpupower.service"
+)
+
+# 工具函数
+cidr_to_netmask() {
+  local prefix="$1"
+  if (( prefix < 0 || prefix > 32 )); then
+    echo ""
+    return 1
+  fi
+  local mask=$(( 0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF ))
+  printf "%d.%d.%d.%d" \
+    $(( (mask>>24)&255 )) $(( (mask>>16)&255 )) $(( (mask>>8)&255 )) $(( mask&255 ))
+}
+
+valid_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r a b c d <<< "$ip"
+  for n in $a $b $c $d; do
+    (( n >= 0 && n <= 255 )) || return 1
+  done
+  return 0
+}
+
+# 0. 一键还原
+restore_from_backup() {
+  info_start "开始执行一键还原"
+  local latest
+  latest=$(ls -1dt "${BACKUP_ROOT}/"*/ 2>/dev/null | head -1 || true)
+  if [[ -z "$latest" ]]; then
+    error "未找到任何备份，无法还原"
+    exit 1
+  fi
+  echo -e "${YELLOW}将从最新备份目录还原: ${latest}${NC}"
+  read -p "确认还原并覆盖系统相关文件？(y/N): " yn
+  [[ "${yn,,}" == "y" ]] || { warn "已取消还原"; return 0; }
+
+  # 使用 tar 管道覆盖还原，避免依赖 rsync
+  if tar -C "$latest" -cf - . | tar -C / -xpf -; then
+    note "文件还原完成"
+  else
+    error "文件还原失败"
+    exit 1
+  fi
+  info_end "一键还原完成"
+}
+
+# 1. 文件系统备份
+backup_files() {
+  info_start "开始相关文件备份"
+  local backup_dir="${BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$backup_dir"
+  note "备份目录创建成功: $backup_dir"
+
+  local file_count=0
+  local manifest="$backup_dir/manifest.txt"
+  : > "$manifest"
+
+  for f in "${FILES_TO_BACKUP[@]}"; do
+    if [[ -f "$f" ]]; then
+      # 使用 cp --parents 保留路径结构，避免依赖 rsync
+      (cd / && cp --parents -a "${f#/}" "$backup_dir"/)
+      echo "$f" >> "$manifest"
+      ((file_count++))
+    fi
+  done
+
+  note "共备份 $file_count 个文件"
+
+  local total
+  total=$(ls -1dt "${BACKUP_ROOT}/"*/ 2>/dev/null | wc -l || echo 0)
+  if (( total > 5 )); then
+    local to_del
+    to_del=$(ls -1dt "${BACKUP_ROOT}/"*/ | tail -n +6)
+    for b in $to_del; do
+      rm -rf "$b"
+    done
+    note "旧备份清理完成"
+  fi
+  info_end "文件备份完成 ${BACKUP_ROOT}/"
+}
+
+# 2. 系统源与PVE处理（PVE 9.0 / Debian 13 trixie）
+source_setting() {
+  info_start "开始PVE源处理"
+
+  # Debian 系统源 (trixie)
+  cat > /etc/apt/sources.list.d/debian.sources << 'EOF'
+Types: deb
+URIs: https://mirrors.ustc.edu.cn/debian
+Suites: trixie trixie-updates trixie-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: https://security.debian.org/debian-security
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+EOF
+  note "Debian(trixie) 系统源配置完成"
+
+  # PVE 免订阅源 (trixie)
+  cat > /etc/apt/sources.list.d/pve-no-subscription.sources << 'EOF'
+Types: deb
+URIs: https://mirrors.ustc.edu.cn/proxmox/debian/pve
+Suites: trixie
+Components: pve-no-subscription
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+EOF
+  note "PVE 免订阅源配置完成"
+
+  # Ceph 免订阅源（若存在）
+  if [[ -f /etc/apt/sources.list.d/ceph.sources ]] || command -v ceph >/dev/null 2>&1; then
+    local ceph_codename
+    ceph_codename=$(ceph -v 2>/dev/null | awk '/ceph/ {print $(NF-1)}' || true)
+    source /etc/os-release
+    if [[ -n "$ceph_codename" ]]; then
+      cat > /etc/apt/sources.list.d/pve-ceph-no-subscription.sources << EOF
+Types: deb
+URIs: https://mirrors.ustc.edu.cn/proxmox/debian/ceph-$ceph_codename
+Suites: $VERSION_CODENAME
+Components: no-subscription
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+EOF
+      note "Ceph 免订阅源配置完成 ($ceph_codename)"
+    else
+      warn "未能识别Ceph版本，跳过Ceph源配置"
+    fi
+  fi
+
+  # 替换 CT 模板源
+  if sed -i.bak 's|http://download.proxmox.com|https://mirrors.ustc.edu.cn/proxmox|g' /usr/share/perl5/PVE/APLInfo.pm; then
+    note "CT 模板源替换完成"
+  else
+    error "CT 模板源替换失败"
+  fi
+
+  # 禁用 PVE 企业源
+  if rm -rvf /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.sources >/dev/null 2>&1; then
+    note "PVE 企业源禁用完成"
+  else
+    warn "PVE 企业源禁用失败或不存在"
+  fi
+
+  # 删除订阅提示（proxmoxlib.js）
+  if [[ -f "/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js" ]]; then
+    if sed -Ezi "s/(Ext.Msg.show\(\{\s+title: gettext\('No valid sub)/void\(\{ \/\/\1/g" "/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"; then
+      systemctl restart pveproxy.service || true
+      note "付费源订阅弹窗移除成功"
+    else
+      warn "付费源订阅弹窗移除失败（可能版本不匹配）"
+    fi
+  else
+    warn "未找到订阅弹窗文件 proxmoxlib.js"
+  fi
+
+  # 删除存储库状态（脆弱）
+  if sed -i '/pmxNodeInfoRepoStatus/,+4d;:go;1!{P;$!N;D};N;bgo' /usr/share/pve-manager/js/pvemanagerlib.js; then
+    note "存储库状态移除完成"
+  else
+    warn "移除存储库状态失败或不匹配"
+  fi
+
+  info_end "PVE源处理完成"
+}
+
+# 3. 系统初始化与仪表增强
+system_init() {
+  export DEBIAN_FRONTEND=noninteractive
+  info_start "开始系统初始化"
+
+  if apt-get update -qq; then
+    note "APT 索引更新成功"
+  else
+    error "APT 索引更新失败"
+  fi
+
+  if apt-get dist-upgrade -y -qq; then
+    note "系统升级完成"
+  else
+    error "系统升级失败"
+  fi
+
+  # 工具与监控
+  if apt-get install -y -qq wget curl vim unzip linux-cpupower chrony lm-sensors nvme-cli smartmontools; then
+    note "工具安装成功"
+  else
+    warn "部分工具安装失败"
+  fi
+
+  # 启用 chrony
+  systemctl disable --now systemd-timesyncd 2>/dev/null || true
+  systemctl enable --now chrony 2>/dev/null || systemctl enable --now chronyd 2>/dev/null || true
+
+  # --------- 仪表板增强：Nodes.pm + pvemanagerlib.js ---------
+  info_start "安装PVE仪表板增强功能"
+
+  local nodes="/usr/share/perl5/PVE/API2/Nodes.pm"
+  local pvemanagerlib="/usr/share/pve-manager/js/pvemanagerlib.js"
+
+  # 备份
+  local dash_backup="${BACKUP_ROOT}/dashboard_$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$dash_backup"
+  [[ -f "$nodes" ]] && cp -a "$nodes" "$dash_backup/Nodes.pm.original"
+  [[ -f "$pvemanagerlib" ]] && cp -a "$pvemanagerlib" "$dash_backup/pvemanagerlib.js.original"
+
+  # 修改 Nodes.pm（outfunc/errfunc 捕获输出）
+  if [[ -f "$nodes" ]]; then
+    local target_line tmp_file
+    target_line=$(grep -n "version_text" "$nodes" | head -1 | cut -d: -f1 || true)
+    if [[ -n "$target_line" ]]; then
+      tmp_file=$(mktemp)
+      awk -v line="$target_line" '
+      {
+        print $0
+        if (NR == line) {
+          print "    # 自定义监控信息开始"
+          print "    eval {"
+          print "        my $buf = q{};"
+          print "        PVE::Tools::run_command([q{cat}, q{/proc/cpuinfo}], outfunc => sub { $buf .= shift }, errfunc => sub { $buf .= shift }, noerr => 1);"
+          print "        my $freq = q{};"
+          print "        PVE::Tools::run_command([q{cpupower}, q{frequency-info}], outfunc => sub { $freq .= shift }, errfunc => sub { $freq .= shift }, noerr => 1);"
+          print "        $res->{cpupower} = $buf . $freq;"
+          print "    };"
+          print "    eval {"
+          print "        my $sbuf = q{};"
+          print "        PVE::Tools::run_command([q{sensors}], outfunc => sub { $sbuf .= shift }, errfunc => sub { $sbuf .= shift }, noerr => 1);"
+          print "        $res->{cpusensors} = $sbuf;"
+          print "        $res->{thermalstate} = $sbuf;"
+          print "    };"
+          print "    eval {"
+          print "        my $nv = q{};"
+          print "        PVE::Tools::run_command([q{nvme}, q{list}], outfunc => sub { $nv .= shift }, errfunc => sub { $nv .= shift }, noerr => 1);"
+          print "        foreach my $dev (q{/dev/nvme0}, q{/dev/nvme1}) {"
+          print "            my $tmp = q{};"
+          print "            PVE::Tools::run_command([q{nvme}, q{smart-log}, $dev], outfunc => sub { $tmp .= shift }, errfunc => sub { $tmp .= shift }, noerr => 1);"
+          print "            $nv .= $tmp if $tmp;"
+          print "        }"
+          print "        $res->{nvme0_status} = $nv;"
+          print "    };"
+          print "    eval {"
+          print "        my $all = q{};"
+          print "        foreach my $drive (</dev/sd[a-z]>) {"
+          print "            my $out = q{};"
+          print "            PVE::Tools::run_command([q{smartctl}, q{-a}, $drive], outfunc => sub { $out .= shift }, errfunc => sub { $out .= shift }, noerr => 1);"
+          print "            $all .= $out if $out;"
+          print "        }"
+          print "        $res->{hdd_temperatures} = $all;"
+          print "    };"
+          print "    # 自定义监控信息结束"
+        }
+      }' "$nodes" > "$tmp_file"
+
+      if perl -c "$tmp_file" >/dev/null 2>&1; then
+        cp -a "$tmp_file" "$nodes"
+        note "Nodes.pm 修改成功"
+      else
+        warn "Nodes.pm 语法检查失败，已跳过"
+      fi
+      rm -f "$tmp_file"
+    else
+      warn "未找到 version_text 插入点，跳过 Nodes.pm 修改"
+    fi
+  else
+    warn "Nodes.pm 文件不存在"
+  fi
+
+  # 修改 pvemanagerlib.js：注入仪表组件
+  if [[ -f "$pvemanagerlib" ]]; then
+    local tmpf ln
+    tmpf=$(mktemp)
+    cat > "$tmpf" << 'EOF'
+    {
+          itemId: 'thermal',
+          colspan: 2,
+          printBar: false,
+          title: gettext('CPU温度'),
+          textField: 'thermalstate',
+          renderer: function(value) {
+              if (!value || value.length === 0) return '未获取到温度信息';
+              const coreTemps = [];
+              let coreMatch;
+              const coreRegex = /(Core\s*\d+|Core\d+|Tdie|Tctl|Physical id\s*\d+).*?\+\s*([\d\.]+)/gi;
+              while ((coreMatch = coreRegex.exec(value)) !== null) {
+                  let label = coreMatch[1];
+                  let tempValue = coreMatch[2];
+                  if (label.match(/Tdie|Tctl/i)) {
+                      coreTemps.push(`CPU温度: <strong>${tempValue}℃</strong>`);
+                  } else {
+                      const coreNumberMatch = label.match(/\d+/);
+                      const coreNum = coreNumberMatch ? parseInt(coreNumberMatch[0]) + 1 : 1;
+                      coreTemps.push(`核心${coreNum}: <strong>${tempValue}℃</strong>`);
+                  }
+              }
+              let igpuTemp = '';
+              const intelIgpuMatch = value.match(/(GFX|Graphics).*?\+\s*([\d\.]+)/i);
+              const amdIgpuMatch = value.match(/(junction|edge).*?\+\s*([\d\.]+)/i);
+              if (intelIgpuMatch) {
+                  igpuTemp = `核显: <strong>${intelIgpuMatch[2]}℃</strong>`;
+              } else if (amdIgpuMatch) {
+                  igpuTemp = `核显: <strong>${amdIgpuMatch[2]}℃</strong>`;
+              }
+              if (coreTemps.length === 0) {
+                  const k10tempMatch = value.match(/k10temp-pci-\w+\n[^+]*\+\s*([\d\.]+)/);
+                  if (k10tempMatch) {
+                      coreTemps.push(`CPU温度: <strong>${k10tempMatch[1]}℃</strong>`);
+                  }
+              }
+              const packageMatch = value.match(/(Package|SoC)\s*(id \d+)?\.*?\+\s*([\d\.]+)/i);
+              const packageTemp = packageMatch ? `CPU Package: <strong>${packageMatch[3]}℃</strong>` : '';
+              const boardTempMatch = value.match(/(?:temp1|motherboard|sys).*?\+\s*([\d\.]+)/i);
+              const boardTemp = boardTempMatch ? `主板: <strong>${boardTempMatch[1]}℃</strong>` : '';
+              let firstLine = coreTemps.slice(0, 4).join(' | ');
+              let secondLine = [packageTemp, igpuTemp, boardTemp].filter(Boolean).join(' | ');
+              const result = [firstLine, secondLine].filter(Boolean).join('<br>');
+              return result || '未获取到温度信息';
+          }
+    },
+    {
+          itemId: 'CPUINFO',
+          colspan: 2,
+          printBar: false,
+          title: gettext('CPU信息'),
+          textField: 'cpupower',
+          renderer:function(value){
+              if (!value || value.length === 0) return '未获取到CPU信息';
+              const lines = value.split('\n');
+              const powerLine = lines[1] || '';
+              const freqLine = lines[0] || '';
+              let power = '未知';
+              if (powerLine) {
+                  const powerMatch = powerLine.match(/([\d\.]+)\s*W/);
+                  if (powerMatch) {
+                      power = powerMatch[1];
+                  }
+              }
+              let currentFreq = '未知';
+              let minFreq = '未知';
+              let maxFreq = '未知';
+              let governor = '未知';
+              if (freqLine) {
+                  const freqMatch = freqLine.match(/([\d\.]+)\s*MHz/);
+                  if (freqMatch) {
+                      currentFreq = (parseFloat(freqMatch[1]) / 1000).toFixed(1);
+                  }
+              }
+              const governorMatch = value.match(/governor\s*"([^"]+)"/);
+              if (governorMatch) {
+                  governor = governorMatch[1];
+              }
+              const minMatch = value.match(/min\s*:\s*([\d\.]+)/);
+              if (minMatch) {
+                  minFreq = (parseFloat(minMatch[1]) / 1000).toFixed(1);
+              }
+              const maxMatch = value.match(/max\s*:\s*([\d\.]+)/);
+              if (maxMatch) {
+                  maxFreq = (parseFloat(maxMatch[1]) / 1000).toFixed(1);
+              }
+              return `温度: <strong>${power}W</strong> | 频率: <strong>${currentFreq}GHz</strong> | MAX: <strong>${maxFreq}GHz</strong> | MIN: <strong>${minFreq}GHz</strong> | 调速器: <strong>${governor}</strong>`;
+            }
+    },
+EOF
+
+    ln=$(sed -n '/pveversion/,+10{/},/{=;q}}' "$pvemanagerlib" 2>/dev/null || true)
+    if [[ -z "$ln" ]]; then
+      ln=$(grep -n "pveversion" "$pvemanagerlib" | head -1 | cut -d: -f1 || true)
+    fi
+    if [[ -n "$ln" ]]; then
+      sed -i "${ln}r $tmpf" "$pvemanagerlib"
+      note "pvemanagerlib.js 修改成功（仪表组件注入）"
+    else
+      warn "找不到 pveversion 插入位置，跳过前端注入"
+    fi
+    rm -f "$tmpf"
+  else
+    warn "pvemanagerlib.js 文件不存在"
+  fi
+
+  if systemctl restart pveproxy; then
+    note "PVE 仪表板增强安装完成"
+    echo
+    echo -e "${YELLOW}一键还原命令: ${WHITE}$0 restore${NC}"
+    echo
+  else
+    warn "PVE 服务重启失败"
+  fi
+
+  # 时区
+  local current_tz
+  current_tz=$(timedatectl show -p Timezone --value)
+  if [[ "$current_tz" != "Asia/Shanghai" ]]; then
+    if timedatectl set-timezone Asia/Shanghai; then
+      note "系统时区设置成功"
+    else
+      error "设置时区失败"
+    fi
+  else
+    note "系统时区已是 Asia/Shanghai"
+  fi
+
+  # NTP服务器（chrony）
+  cat > /etc/chrony/chrony.conf << 'EOF'
+pool ntp.aliyun.com iburst
+pool ntp.tencent.com iburst
+pool cn.pool.ntp.org iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+EOF
+  systemctl restart chrony 2>/dev/null || systemctl restart chronyd 2>/dev/null || true
+  note "NTP 服务器配置完成"
+
+  info_end "系统初始化完成"
+}
+
+# 4. 网络配置（交互 + 持久化 /etc/network/interfaces）
+configure_network() {
+  info_start "开始网络配置"
+
+  local iface cur_ip cur_ip6 cur_gw cur_dns
+  iface=$(ip -o link show | awk -F': ' '$2 ~ /^vmbr[0-9]+/ {print $2; exit}')
+  [[ -z "$iface" ]] && iface=$(ip -o link show | awk -F': ' '!/lo|docker/ {print $2; exit}')
+
+  cur_ip=$(ip -4 addr show "$iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -1 || true)
+  cur_ip6=$(ip -6 addr show "$iface" | grep -oP '(?<=inet6\s)[0-9a-fA-F:/]+' | grep -v '^fe80:' | head -1 || true)
+  cur_gw=$(ip route | awk '/default/ {print $3; exit}' || true)
+  cur_dns=$(awk '/^dns-nameservers/ {for(i=2;i<=NF;i++) printf "%s%s",$i,(i<NF?",":"");print ""}' /etc/network/interfaces | head -1 || true)
+
+  # IPv4 CIDR 交互
+  local change_cidr new_cidr
+  for i in {1..3}; do
+    read -p "是否修改 IPv4 CIDR（当前：${cur_ip:-未配置}）？[n]: " change_cidr
+    change_cidr=${change_cidr:-n}
+    [[ "$change_cidr" =~ ^[Yy]$ ]] || { note "IPv4 CIDR 保持不变"; break; }
+
+    read -p "请输入新的 IPv4 CIDR（如 192.168.1.100/24）: " new_cidr
+    if [[ "$new_cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]]; then
+      IFS=/ read -r ip prefix <<< "$new_cidr"
+      if valid_ipv4 "$ip" && (( prefix>=0 && prefix<=32 )); then
+        note "CIDR 地址配置完成: $new_cidr"
+        cur_ip="$new_cidr"
+        break
+      fi
+    fi
+    warn "格式错误（剩余尝试: $((3-i))）"
+    [[ $i -eq 3 ]] && error "超过最大尝试次数"
+  done
+
+  # IPv6 CIDR 交互
+  local change_cidr6 new_cidr6
+  cur_ip6=$(ip -6 addr show "$iface" | grep -oP '(?<=inet6\s)[0-9a-fA-F:/]+' | grep -v '^fe80:' | head -1 || true)
+  for i in {1..3}; do
+    read -p "是否修改 IPv6 CIDR（当前：${cur_ip6:-未配置}）？[Y]: " change_cidr6
+    change_cidr6=${change_cidr6:-y}
+    [[ "$change_cidr6" =~ ^[Yy]$ ]] || { note "IPv6 CIDR 保持不变"; break; }
+
+    read -p "请输入新的 IPv6 CIDR（如 2001:db8::1/64）: " new_cidr6
+    if [[ "$new_cidr6" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]]; then
+      note "IPv6 CIDR 地址配置完成: $new_cidr6"
+      cur_ip6="$new_cidr6"
+      break
+    else
+      warn "格式错误（剩余尝试: $((3-i))）"
+      [[ $i -eq 3 ]] && error "超过最大尝试次数"
+    fi
+  done
+
+  # 默认网关交互
+  local change_gw new_gw
+  for i in {1..3}; do
+    read -p "是否修改默认网关（当前：${cur_gw:-未配置}）？[n]: " change_gw
+    change_gw=${change_gw:-n}
+    [[ "$change_gw" =~ ^[Yy]$ ]] || { note "默认网关保持不变"; break; }
+
+    read -p "请输入新的网关地址: " new_gw
+    if valid_ipv4 "$new_gw"; then
+      note "默认网关配置完成: $new_gw"
+      cur_gw="$new_gw"
+      break
+    else
+      warn "格式错误（剩余尝试: $((3-i))）"
+      [[ $i -eq 3 ]] && error "超过最大尝试次数"
+    fi
+  done
+
+  # DNS 交互（写入 /etc/network/interfaces）
+  local add_dns new_dns
+  for i in {1..3}; do
+    read -p "是否要追加 DNS 服务器（当前：${cur_dns:-未配置}）？[Y]: " add_dns
+    add_dns=${add_dns:-y}
+    [[ "$add_dns" =~ ^[Yy]$ ]] || { note "DNS 保持不变"; break; }
+
+    read -p "请输入要追加的 DNS（最多三个，英文逗号分隔）: " new_dns
+    IFS=',' read -ra dns_arr <<< "$new_dns"
+
+    local valid_dns=() d
+    for d in "${dns_arr[@]}"; do
+      d="${d//[[:space:]]/}"
+      if valid_ipv4 "$d"; then
+        valid_dns+=("$d")
+      elif [[ "$d" =~ ^[0-9a-fA-F:]+$ ]]; then
+        valid_dns+=("$d")
+      fi
+    done
+
+    if ((${#valid_dns[@]} == 0)); then
+      warn "没有有效 DNS（剩余尝试: $((3-i))）"
+      [[ $i -eq 3 ]] && error "超过最大尝试次数"
+    else
+      local exist_line new_line all_dns
+      exist_line=$(awk -v IFACE="$iface" '
+        $0 ~ "^iface "IFACE" inet " {inblk=1; next}
+        inblk && /^iface / {inblk=0}
+        inblk && /^dns-nameservers/ {print; exit}
+      ' /etc/network/interfaces || true)
+      if [[ -n "$exist_line" ]]; then
+        all_dns=($exist_line)
+        all_dns=("${all_dns[@]:1}")
+      else
+        all_dns=()
+      fi
+      for d in "${valid_dns[@]}"; do
+        [[ " ${all_dns[*]} " == *" $d "* ]] || all_dns+=("$d")
+      done
+      all_dns=("${all_dns[@]:0:3}")
+
+      local tmp_if="/etc/network/interfaces.tmp.$$"
+      awk -v IFACE="$iface" -v LINE="dns-nameservers ${all_dns[*]}" '
+        BEGIN{inblk=0; done=0}
+        {
+          if ($0 ~ "^iface "IFACE" inet ") { inblk=1; print; next }
+          if (inblk && /^iface /) {
+            if (!done) print "    " LINE
+            inblk=0
+          }
+          if (inblk && /^dns-nameservers/) { next }
+          print
+        }
+        END {
+          if (inblk && !done) print "    " LINE
+        }
+      ' /etc/network/interfaces > "$tmp_if" && mv "$tmp_if" /etc/network/interfaces
+
+      note "DNS 配置已写入 /etc/network/interfaces"
+      break
+    fi
+  done
+
+  # 写入/更新 IPv4 到 /etc/network/interfaces（删除旧块后重写）
+  if [[ -n "$cur_ip" ]]; then
+    IFS=/ read -r ip4 prefix <<< "$cur_ip"
+    local mask
+    mask=$(cidr_to_netmask "$prefix")
+    local tmp_if="/etc/network/interfaces.tmp.$$"
+    awk -v IFACE="$iface" -v IP="$ip4" -v MASK="$mask" -v GW="$cur_gw" '
+      BEGIN{inblk=0}
+      {
+        if ($0 ~ "^iface "IFACE" inet ") { inblk=1; next }
+        if (inblk && /^iface /) { inblk=0 }
+        if (inblk) next
+        if ($0 ~ "^auto "IFACE"$") next
+        print
+      }
+      END{
+        print ""
+        print "auto " IFACE
+        print "iface " IFACE " inet static"
+        print "    address " IP
+        print "    netmask " MASK
+        if (GW != "") print "    gateway " GW
+      }
+    ' /etc/network/interfaces > "$tmp_if" && mv "$tmp_if" /etc/network/interfaces
+    note "IPv4 持久化配置完成"
+  fi
+
+  # 写入/更新 IPv6 到 /etc/network/interfaces（删除旧块后重写）
+  if [[ -n "$cur_ip6" ]]; then
+    local tmp_if6="/etc/network/interfaces.tmp6.$$"
+    awk -v IFACE="$iface" -v CIDR6="$cur_ip6" '
+      BEGIN{inblk=0}
+      {
+        if ($0 ~ "^iface "IFACE" inet6 ") { inblk=1; next }
+        if (inblk && /^iface /) { inblk=0 }
+        if (inblk) next
+        print
+      }
+      END{
+        print ""
+        print "iface " IFACE " inet6 static"
+        print "    address " CIDR6
+      }
+    ' /etc/network/interfaces > "$tmp_if6" && mv "$tmp_if6" /etc/network/interfaces
+    note "IPv6 持久化配置完成"
+  fi
+
+  # 网卡名称处理（可选）
+  if ! ip -o link show | awk -F': ' '{print $2}' | grep -q '^eth0$'; then
+    local change_eth
+    read -p "是否将系统网卡名称改为传统 eth0？[Y]: " change_eth
+    change_eth=${change_eth:-y}
+    if [[ "$change_eth" =~ ^[Yy]$ ]]; then
+      # 修改 GRUB_CMDLINE_LINUX_DEFAULT，去重后追加
+      local current_cmdline cleaned_cmdline new_cmdline
+      current_cmdline=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | cut -d'"' -f2 || echo "")
+      cleaned_cmdline=$(echo "$current_cmdline" | sed -e 's/net\\.ifnames=[^ ]*//g' -e 's/biosdevname=[^ ]*//g')
+      new_cmdline="$(echo "$cleaned_cmdline" | sed -e "s/[[:space:]]\+/ /g" -e "s/^ //g" -e "s/ $//g") net.ifnames=0 biosdevname=0"
+      sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"${new_cmdline}\"/" /etc/default/grub
+      update-grub >/dev/null 2>&1 || warn "update-grub 失败"
+
+      # 写入 udev 规则
+      local MAC
+      MAC=$(ip -o link show "$iface" | awk '/link\/ether/ {print $2; exit}')
+      if [[ -n "$MAC" ]]; then
+        cat > /etc/udev/rules.d/70-persistent-net.rules << EOF
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="$MAC", NAME="eth0"
+EOF
+        note "网卡命名已设置为 eth0（需重启生效）"
+      else
+        warn "未能获取MAC地址，跳过udev规则写入"
+      fi
+
+      # 更新 interfaces 中 iface 名称
+      sed -i "s/^auto $iface$/auto eth0/g; s/^iface $iface /iface eth0 /g" /etc/network/interfaces
+      iface="eth0"
+    else
+      note "已选择不修改网卡名称"
+    fi
+  else
+    note "系统网卡已经是 eth0，无需修改"
+  fi
+
+  # 应用网络配置
+  if command -v ifreload >/dev/null 2>&1; then
+    ifreload -a || warn "ifreload -a 执行失败，请考虑重启"
+  else
+    systemctl restart networking || warn "networking 重启失败，请考虑重启"
+  fi
+
+  info_end "网络配置完成"
+}
+
+# 5. 存储优化
+optimize_storage() {
+  info_start "开始存储优化"
+
+  if lvs | grep -q "data.*pve"; then
+    note "检测到 pve/data 逻辑卷"
+
+    local vm_count
+    vm_count=$(pvesm list local-lvm 2>/dev/null | awk 'NR>1 {print}' | wc -l || echo "0")
+    if [ "$vm_count" -gt 0 ]; then
+      warn "local-lvm 存储上可能有 $vm_count 个虚拟机/模板"
+      local running_vms running_cts
+      running_vms=$(qm list | awk 'NR>1 {print $1}')
+      running_cts=$(pct list | awk 'NR>1 {print $1}')
+      if [ -n "$running_vms$running_cts" ]; then
+        warn "发现运行中的 VM/CT，将尝试停止..."
+        for vm in $running_vms; do
+          note "停止 VM $vm"; qm stop $vm --force || true
+        done
+        for ct in $running_cts; do
+          note "停止 CT $ct"; pct stop $ct --force || true
+        done
+      fi
+      local force_delete
+      read -p "是否仍要继续删除 local-lvm? (y/N): " force_delete
+      [[ "$force_delete" =~ ^[Yy]$ ]] || { error "操作已取消"; exit 1; }
+      note "将强制继续删除操作"
+    else
+      note "未检测到虚拟机/模板，可以安全删除"
+    fi
+
+    lvremove -y pve/data >/dev/null 2>&1 || { error "删除 pve/data 逻辑卷失败"; exit 1; }
+    note "删除 pve/data 逻辑卷完成"
+
+    lvextend -l +100%FREE -r pve/root >/dev/null 2>&1 || { error "扩展 pve/root 逻辑卷失败"; exit 1; }
+    note "释放存储完成"
+
+    pvesm remove local-lvm >/dev/null 2>&1 || { error "删除 local-lvm 存储失败"; exit 1; }
+    note "删除 local-lvm 完成"
+  else
+    note "未发现 pve/data 逻辑卷，跳过存储合并"
+  fi
+
+  pvesm set local --content rootdir,images,iso,vztmpl,backup || true
+  note "local 存储内容已勾选全部类型"
+
+  # SWAP配置
+  note "检查SWAP状态"
+  if grep -q "/dev/pve/swap" /proc/swaps || grep -q "^/dev/pve/swap.*swap" /etc/fstab; then
+    cp -a /etc/fstab /etc/fstab.bak 2>/dev/null || true
+    sed -i 's|^/dev/pve/swap.*swap.*|#&|' /etc/fstab || { error "修改/etc/fstab失败"; exit 1; }
+    swapoff -a 2>/dev/null || true
+    note "永久禁用swap"
+  else
+    note "swap已禁用，跳过优化"
+  fi
+
+  info_end "存储优化完成"
+}
+
+# 6. 硬件优化（IOMMU + cpupower）
+optimize_hw() {
+  info_start "开始硬件优化"
+
+  optimize_iommu() {
+    local cpu_type desired_param current_cmdline new_cmdline cleaned_cmdline
+    if grep -q "Intel" /proc/cpuinfo; then
+      cpu_type="Intel"; desired_param="intel_iommu=on iommu=pt"
+    elif grep -q "AMD" /proc/cpuinfo; then
+      cpu_type="AMD"; desired_param="amd_iommu=on iommu=pt"
+    else
+      error "无法识别CPU类型，跳过CPU直通优化"; return
+    fi
+
+    current_cmdline=$(grep "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub | cut -d'"' -f2)
+    if [[ "$current_cmdline" == *"$desired_param"* ]]; then
+      note "CPU直通已开启，跳过GRUB修改"
+    else
+      if [[ -z "$current_cmdline" || "$current_cmdline" == "quiet" ]]; then
+        new_cmdline="quiet $desired_param"
+      else
+        cleaned_cmdline=$(echo "$current_cmdline" | sed -e "s/intel_iommu=[^ ]*//g" -e "s/amd_iommu=[^ ]*//g" -e "s/iommu=pt//g")
+        new_cmdline="$cleaned_cmdline $desired_param"
+      fi
+      sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"$new_cmdline\"/" /etc/default/grub || {
+        error "修改GRUB配置文件失败"; exit 1; }
+      update-grub >/dev/null 2>&1 || { error "更新GRUB配置失败"; exit 1; }
+      note "CPU直通优化完成（$cpu_type）"
+    fi
+
+    # VFIO 模块
+    cat > /etc/modules-load.d/10-vfio-modules.conf << 'EOF'
+# VFIO modules for PCI passthrough
+vfio
+vfio_iommu_type1
+vfio_pci
+vfio_virqfd
+EOF
+    note "VFIO 模块配置完成"
+
+    update-initramfs -u -k all >/dev/null 2>&1 || { error "更新 initramfs 失败"; exit 1; }
+    note "initramfs 更新完成"
+  }
+
+  optimize_cpupower() {
+    local cpupower_config="/etc/default/cpupower"
+    local service_config="/etc/systemd/system/cpupower.service"
+
+    get_cpu_driver() {
+      if command -v cpupower >/dev/null 2>&1; then
+        local driver_info
+        driver_info=$(cpupower -c 0 frequency-info 2>/dev/null | awk -F': ' '/driver:/ {print $2}' | head -n1 | tr -d '[:space:]')
+        if [[ -n "$driver_info" ]]; then
+          echo "$driver_info"; return
+        fi
+        if lsmod | grep -q intel_pstate; then echo "intel_pstate"; return; fi
+        if lsmod | grep -q acpi_cpufreq; then echo "acpi-cpufreq"; return; fi
+      fi
+      echo "unknown"
+    }
+
+    get_current_governor() {
+      local paths=(
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+      )
+      for p in "${paths[@]}"; do
+        [[ -f "$p" ]] && { cat "$p"; return; }
+      done
+      if command -v cpupower >/dev/null 2>&1; then
+        cpupower frequency-info -p 2>/dev/null | grep -oP "governor.*'\K[^']+" | head -1 && return
+      fi
+      echo "unknown"
+    }
+
+    get_available_governors() {
+      local p1="/sys/devices/system/cpu/cpufreq/policy0/scaling_available_governors"
+      local p2="/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+      if [[ -f "$p1" ]]; then cat "$p1"; return; fi
+      if [[ -f "$p2" ]]; then cat "$p2"; return; fi
+      echo "performance powersave"
+    }
+
+    get_optimal_governor() {
+      case "$1" in
+        intel_cpufreq|acpi-cpufreq) echo "schedutil" ;;
+        intel_pstate) echo "powersave" ;;
+        *) echo "performance" ;;
+      esac
+    }
+
+    get_fallback_governor() {
+      case "$1" in
+        intel_cpufreq|acpi-cpufreq) echo "ondemand" ;;
+        intel_pstate) echo "performance" ;;
+        *) echo "powersave" ;;
+      esac
+    }
+
+    create_cpupower_config() {
+      cat > "$cpupower_config" << EOF
+# CPU power configuration
+CPUPOWER_START_OPTS="frequency-set -g $1"
+CPUPOWER_STOP_OPTS="frequency-set -g $2"
+EOF
+      note "调度器配置文件创建成功"
+    }
+
+    create_service_config() {
+      cat > "$service_config" << 'EOF'
+[Unit]
+Description=Apply cpupower configuration
+ConditionVirtualization=!container
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/cpupower
+ExecStart=/usr/bin/cpupower $CPUPOWER_START_OPTS
+ExecStop=/usr/bin/cpupower $CPUPOWER_STOP_OPTS
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      note "调度器服务文件创建成功"
+    }
+
+    apply_configuration() {
+      if command -v cpupower >/dev/null 2>&1; then
+        cpupower frequency-set -g "$1" >/dev/null 2>&1 || warn "无法立即设置CPU调度器为 $1"
+      else
+        warn "cpupower 不可用，跳过实时配置"
+      fi
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable cpupower.service >/dev/null 2>&1 && systemctl start cpupower.service >/dev/null 2>&1 && \
+        note "CPU调度器服务已启用并启动" || error "CPU调度器服务配置失败"
+    }
+
+    note "正在检测CPU信息..."
+    local driver current_governor available_governors optimal_governor stop_governor
+    driver=$(get_cpu_driver)
+    current_governor=$(get_current_governor)
+    available_governors=$(get_available_governors)
+    optimal_governor=$(get_optimal_governor "$driver")
+    stop_governor=$(get_fallback_governor "$driver")
+
+    echo -e "  ${CYAN}CPU驱动:${NC} ${GREEN}$driver${NC}"
+    echo -e "  ${CYAN}当前模式:${NC} ${YELLOW}$current_governor${NC}"
+    echo -e "  ${CYAN}支持模式:${NC} ${GREEN}$available_governors${NC}"
+    echo -e "  ${CYAN}推荐模式:${NC} ${GREEN}$optimal_governor${NC}"
+    echo
+
+    if ! echo "$available_governors" | grep -qw "$optimal_governor"; then
+      warn "推荐调度器 '$optimal_governor' 不可用，回退"
+      if echo "$available_governors" | grep -qw "performance"; then
+        optimal_governor="performance"; stop_governor="powersave"
+      elif echo "$available_governors" | grep -qw "powersave"; then
+        optimal_governor="powersave"; stop_governor="performance"
+      else
+        local first_governor
+        first_governor=$(echo "$available_governors" | awk '{print $1}')
+        optimal_governor="$first_governor"; stop_governor="$first_governor"
+        warn "使用第一个可用调度器: $first_governor"
+      fi
+    fi
+
+    create_cpupower_config "$optimal_governor" "$stop_governor"
+    create_service_config
+    apply_configuration "$optimal_governor"
+  }
+
+  optimize_iommu
+  optimize_cpupower
+  info_end "硬件优化完成"
+}
+
+# 7. 系统清理（安全）
+system_clean() {
+  info_start "开始系统清理"
+  apt-get clean -y >/dev/null 2>&1 || true
+  apt-get autoclean -y >/dev/null 2>&1 || true
+  apt-get autoremove --purge -y >/dev/null 2>&1 || true
+  note "APT 清理完成"
+
+  journalctl --vacuum-time=7d >/dev/null 2>&1 || true
+  note "日志清理（保留7天）完成"
+
+  find /var/lib/apt/lists/ -type f -delete >/dev/null 2>&1 || true
+  note "APT 列表缓存清理完成"
+
+  if rm -f ~/.bash_history >/dev/null 2>&1 && history -c; then
+    note "命令历史记录清理完成"
+  fi
+
+  info_end "系统清理完成"
+}
+
+# 主执行流程
+main() {
+  if [[ "${1:-}" == "restore" ]]; then
+    restore_from_backup
+    exit 0
+  fi
+
+  backup_files
+  source_setting
+  system_init
+  configure_network
+  optimize_storage
+  optimize_hw
+  system_clean
+
+  note "所有优化配置已完成"
+
+  local reboot_now
+  read -p "是否立即重启系统？[Y/n]: " reboot_now
+  reboot_now=${reboot_now:-y}
+  if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
+    note "系统将在5秒后重启..."
+    sleep 5
+    reboot
+  else
+    note "已选择稍后重启，请注意部分配置需重启生效"
+  fi
+}
+
+main "$@"
