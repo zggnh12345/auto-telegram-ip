@@ -1,51 +1,93 @@
 name: Update Telegram IP Routes (IPv4 & IPv6)
 
+permissions:
+  contents: write
+
 on:
   schedule:
-    - cron: '0 1 * * *'  # 每天 UTC 时间 1:00 运行
-    - cron: '0 0 1 * *'  # 每月1号 UTC 时间 0:00 运行（强制更新）
-  workflow_dispatch:      # 允许手动触发
+    - cron: '0 1 * * *'    # 每日常规更新
+    - cron: '0 0 1 * *'    # 每月强制更新
+  workflow_dispatch:       # 手动触发
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Generate Route Script
-      run: |
-        chmod +x ./generate-telegram-routes.sh
-        ./generate-telegram-routes.sh
+      - name: Prepare and generate files
+        run: |
+          set -euo pipefail
+          set -x
 
-    - name: Commit and Push Updated RSC Files
-      run: |
-        set -euo pipefail
+          # 判断是否为每月1号的定时任务
+          IS_SCHEDULE="${GITHUB_EVENT_NAME:-}"
+          UTC_DAY="$(date -u +%d)"
+          echo "event: $IS_SCHEDULE, utc_day: $UTC_DAY"
 
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-
-        # 暂存目标文件（若不存在也不会中断）
-        git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
-
-        # 若是每月1号（UTC），则保证有一次提交：先尝试正常提交（若有变更），否则强制空提交；非1号则只在有变更时提交
-        if [ "$(date -u +%d)" = "01" ]; then
-          echo "Today is 1st of month (UTC): ensuring a commit (normal or --allow-empty)..."
-          if ! git diff --cached --quiet; then
-            git commit -m "🤖 每月强制更新 Telegram IP 路由和地址列表 (files changed)"
-          else
-            git commit --allow-empty -m "🤖 每月保活提交 [keep-alive] $(date -u +%Y-%m-%d) [ci skip]"
+          # 检查生成脚本
+          if [ ! -f "./generate-telegram-routes.sh" ]; then
+            echo "::error::generate-telegram-routes.sh not found"
+            exit 1
           fi
-          git push
-          echo "Monthly forced update / keep-alive pushed."
-        else
-          # 非 1 号：仅在有文件变更时提交并推送
-          if ! git diff --cached --quiet; then
-            git commit -m "🤖 自动更新 Telegram IP 路由和地址列表"
-            git push
-            echo "Daily update with changes pushed."
+          chmod +x ./generate-telegram-routes.sh
+
+          # 每月1号删除旧文件后生成，其他情况直接生成
+          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "01" ]; then
+            echo "::notice::Monthly delete + generate"
+            rm -f routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
+            ./generate-telegram-routes.sh
           else
-            echo "No changes in RSC files. Skipping commit."
+            echo "::notice::Regular generate only"
+            ./generate-telegram-routes.sh
           fi
-        fi
+
+      - name: Commit and Push changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          set -x
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 暂存生成的文件
+          git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
+
+          # 提交逻辑：每月1号强制提交，其他情况仅在有变更时提交
+          IS_SCHEDULE="${GITHUB_EVENT_NAME:-}"
+          UTC_DAY="$(date -u +%d)"
+
+          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "01" ]; then
+            echo "::notice::Monthly forced commit"
+            # 验证文件生成成功
+            if git diff --cached --quiet; then
+              echo "::error::No files generated"
+              git status --porcelain
+              exit 1
+            fi
+            git commit -m "Monthly forced update: Telegram IP routes"
+            git push origin "HEAD:main"
+          else
+            echo "::notice::Daily conditional commit"
+            if git diff --cached --quiet; then
+              echo "::notice::No changes, skip commit"
+            else
+              git commit -m "Automatic update: Telegram IP routes"
+              git push origin "HEAD:main"
+            fi
+          fi
+
+      - name: Verify remote branch (debug)
+        run: |
+          set -x
+          # 验证远程状态
+          git ls-remote origin refs/heads/main || true
+          git fetch origin main --depth=1 || true
+          git --no-pager log -1 --pretty=fuller origin/main || true
