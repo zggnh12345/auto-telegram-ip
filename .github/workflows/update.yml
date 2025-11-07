@@ -6,7 +6,7 @@ permissions:
 on:
   schedule:
     - cron: '0 1 * * *'    # 每日常规更新
-    - cron: '0 0 5 * *'    # 每月强制更新
+    - cron: '0 0 7 * *'    # 每月强制更新
   workflow_dispatch:       # 手动触发
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
           chmod +x ./generate-telegram-routes.sh
 
           # 每月1号删除旧文件后生成，其他情况直接生成
-          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "01" ]; then
+          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "07" ]; then
             echo "::notice::Monthly delete + generate"
             rm -f routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
             ./generate-telegram-routes.sh
@@ -64,7 +64,7 @@ jobs:
           IS_SCHEDULE="${GITHUB_EVENT_NAME:-}"
           UTC_DAY="$(date -u +%d)"
 
-          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "01" ]; then
+          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "07" ]; then
             echo "::notice::Monthly forced commit"
             # 验证文件生成成功
             if git diff --cached --quiet; then
