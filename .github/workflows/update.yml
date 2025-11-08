@@ -26,6 +26,7 @@ jobs:
           UTC_DAY="$(date -u +%d)"
           echo "utc_day=${UTC_DAY}" >> $GITHUB_OUTPUT
 
+          # 仅当 schedule 触发且为 1 号时启用月度强制模式
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${UTC_DAY}" = "01" ]; then
             echo "is_monthly_forced=true" >> $GITHUB_OUTPUT
             echo "::notice::🗓️ 月度强制更新模式（仓库保活）"
@@ -39,24 +40,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -f "routeros-telegram-routes.rsc" ]; then
-            echo "::notice::🆕 检测到首次运行，将创建初始文件"
-          fi
-
+          # 验证脚本存在
           if [ ! -f "./generate-telegram-routes.sh" ]; then
             echo "::error::脚本不存在"
             exit 1
           fi
           chmod +x ./generate-telegram-routes.sh
 
+          # 月度强制模式：先删除旧文件
           if [ "${{ steps.mode.outputs.is_monthly_forced }}" = "true" ]; then
             echo "::notice::🔄 删除旧文件以强制重新生成"
             rm -f routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
           fi
 
+          # 执行生成脚本
           echo "::notice::🔧 开始生成路由文件"
           ./generate-telegram-routes.sh
 
+          # 验证生成结果
           if [ ! -f "routeros-telegram-routes.rsc" ] || [ ! -s "routeros-telegram-routes.rsc" ]; then
             echo "::error::路由文件生成失败或为空"
             exit 1
@@ -66,6 +67,7 @@ jobs:
             exit 1
           fi
 
+          # 统计并输出
           ROUTE_COUNT=$(grep -c 'add comment=' routeros-telegram-routes.rsc || echo 0)
           ADDR_COUNT=$(grep -c 'add list=' routeros-telegram-addresslist.rsc || echo 0)
           echo "route_count=${ROUTE_COUNT}" >> $GITHUB_OUTPUT
@@ -76,6 +78,7 @@ jobs:
         id: changes
         if: steps.mode.outputs.is_monthly_forced != 'true'
         run: |
+          # 仅在常规模式下检查变更
           if [ -n "$(git status --porcelain routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc)" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
             echo "::notice::✅ 检测到文件变更"
@@ -86,42 +89,46 @@ jobs:
 
       - name: 提交并推送
         if: steps.mode.outputs.is_monthly_forced == 'true' || steps.changes.outputs.has_changes == 'true'
-        env:
-          ROUTE_COUNT: ${{ steps.gen.outputs.route_count }}
-          ADDR_COUNT: ${{ steps.gen.outputs.addr_count }}
-          IS_MONTHLY: ${{ steps.mode.outputs.is_monthly_forced }}
         run: |
           set -euo pipefail
           
+          # 配置 Git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # 使用 git add -A 处理所有变更（新增/修改/删除）
           git add -A routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
           
+          # 从前一步骤获取统计数据（避免重复计算）
+          ROUTE_COUNT=${{ steps.gen.outputs.route_count }}
+          ADDR_COUNT=${{ steps.gen.outputs.addr_count }}
           COMMIT_DATE="$(date -u +%Y-%m-%d)"
 
-          if [ "${IS_MONTHLY}" = "true" ]; then
-            git commit --allow-empty -m "chore: 月度强制更新（仓库保活）[${COMMIT_DATE}]
-
-- 路由条目: ${ROUTE_COUNT}
-- 地址列表: ${ADDR_COUNT}
-- 强制提交以保持仓库活跃"
+          if [ "${{ steps.mode.outputs.is_monthly_forced }}" = "true" ]; then
+            # 月度强制模式：使用 --allow-empty 保证提交
+            git commit --allow-empty -m "chore: 月度强制更新（仓库保活）[${COMMIT_DATE}]" \
+              -m "" \
+              -m "- 路由条目: ${ROUTE_COUNT}" \
+              -m "- 地址列表: ${ADDR_COUNT}" \
+              -m "- 强制提交以保持仓库活跃"
             
             echo "::notice::🚀 月度保活提交已创建"
           else
+            # 常规模式：有变更才提交
             if git diff --cached --quiet; then
               echo "::notice::ℹ️ 无变更需要提交"
               exit 0
             fi
             
-            git commit -m "chore: 更新 Telegram IP 路由 [${COMMIT_DATE}]
-
-- 路由条目: ${ROUTE_COUNT}
-- 地址列表: ${ADDR_COUNT}"
+            git commit -m "chore: 更新 Telegram IP 路由 [${COMMIT_DATE}]" \
+              -m "" \
+              -m "- 路由条目: ${ROUTE_COUNT}" \
+              -m "- 地址列表: ${ADDR_COUNT}"
             
             echo "::notice::✅ 变更已提交"
           fi
           
+          # 推送到主分支
           git push origin HEAD:main
           echo "::notice::📤 推送完成"
 
