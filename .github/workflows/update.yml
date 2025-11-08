@@ -5,9 +5,9 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 0 2-31 * *'    # 每日常规更新
-    - cron: '0 0 1 * *'    # 每月强制更新
-  workflow_dispatch:       # 手动触发
+    - cron: '0 0 2-31 * *'    # 常规更新（2-31号 UTC 0:00）
+    - cron: '0 0 1 * *'       # 强制更新（1号 UTC 0:00，仓库保活）
+  workflow_dispatch:
 
 jobs:
   generate:
@@ -20,74 +20,134 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare and generate files
+      - name: 判断更新模式
+        id: mode
+        run: |
+          UTC_DAY="$(date -u +%d)"
+          echo "utc_day=${UTC_DAY}" >> $GITHUB_OUTPUT
+
+          # 仅当 schedule 触发且为 1 号时启用月度强制模式
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${UTC_DAY}" = "01" ]; then
+            echo "is_monthly_forced=true" >> $GITHUB_OUTPUT
+            echo "::notice::🗓️ 月度强制更新模式（仓库保活）"
+          else
+            echo "is_monthly_forced=false" >> $GITHUB_OUTPUT
+            echo "::notice::📅 常规更新模式"
+          fi
+
+      - name: 生成路由文件
+        id: gen
         run: |
           set -euo pipefail
-          set -x
 
-          # 判断是否为每月1号的定时任务
-          IS_SCHEDULE="${GITHUB_EVENT_NAME:-}"
-          UTC_DAY="$(date -u +%d)"
-          echo "event: $IS_SCHEDULE, utc_day: $UTC_DAY"
-
-          # 检查生成脚本
+          # 验证脚本存在
           if [ ! -f "./generate-telegram-routes.sh" ]; then
-            echo "::error::generate-telegram-routes.sh not found"
+            echo "::error::脚本不存在"
             exit 1
           fi
           chmod +x ./generate-telegram-routes.sh
 
-          # 每月1号删除旧文件后生成，其他情况直接生成
-          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "01" ]; then
-            echo "::notice::Monthly delete + generate"
-            rm -f routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
-            ./generate-telegram-routes.sh
-          else
-            echo "::notice::Regular generate only"
-            ./generate-telegram-routes.sh
+          # 月度强制模式：先删除旧文件
+          if [ "${{ steps.mode.outputs.is_monthly_forced }}" = "true" ]; then
+            echo "::notice::🔄 删除旧文件以强制重新生成"
+            rm -f routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
           fi
 
-      - name: Commit and Push changes
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 执行生成脚本
+          echo "::notice::🔧 开始生成路由文件"
+          ./generate-telegram-routes.sh
+
+          # 验证生成结果
+          if [ ! -f "routeros-telegram-routes.rsc" ] || [ ! -s "routeros-telegram-routes.rsc" ]; then
+            echo "::error::路由文件生成失败或为空"
+            exit 1
+          fi
+          if [ ! -f "routeros-telegram-addresslist.rsc" ] || [ ! -s "routeros-telegram-addresslist.rsc" ]; then
+            echo "::error::地址列表文件生成失败或为空"
+            exit 1
+          fi
+
+          # 统计并输出
+          ROUTE_COUNT=$(grep -c 'add comment=' routeros-telegram-routes.rsc || echo 0)
+          ADDR_COUNT=$(grep -c 'add list=' routeros-telegram-addresslist.rsc || echo 0)
+          echo "route_count=${ROUTE_COUNT}" >> $GITHUB_OUTPUT
+          echo "addr_count=${ADDR_COUNT}" >> $GITHUB_OUTPUT
+          echo "::notice::✅ 生成完成 | 路由: ${ROUTE_COUNT} | 地址列表: ${ADDR_COUNT}"
+
+      - name: 检查文件变更
+        id: changes
+        if: steps.mode.outputs.is_monthly_forced != 'true'
+        run: |
+          # 仅在常规模式下检查变更
+          if [ -n "$(git status --porcelain routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "::notice::✅ 检测到文件变更"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "::notice::ℹ️ 文件无变更"
+          fi
+
+      - name: 提交并推送
+        if: steps.mode.outputs.is_monthly_forced == 'true' || steps.changes.outputs.has_changes == 'true'
         run: |
           set -euo pipefail
-          set -x
-
+          
+          # 配置 Git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 暂存生成的文件
-          git add routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc || true
+          # 使用 git add -A 处理所有变更（新增/修改/删除）
+          git add -A routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
+          
+          # 从前一步骤获取统计数据（避免重复计算）
+          ROUTE_COUNT=${{ steps.gen.outputs.route_count }}
+          ADDR_COUNT=${{ steps.gen.outputs.addr_count }}
+          COMMIT_DATE="$(date -u +%Y-%m-%d)"
 
-          # 提交逻辑：每月1号强制提交，其他情况仅在有变更时提交
-          IS_SCHEDULE="${GITHUB_EVENT_NAME:-}"
-          UTC_DAY="$(date -u +%d)"
+          if [ "${{ steps.mode.outputs.is_monthly_forced }}" = "true" ]; then
+            # 月度强制模式：使用 --allow-empty 保证提交
+            git commit --allow-empty -m "chore: 月度强制更新（仓库保活）[${COMMIT_DATE}]
 
-          if [ "$IS_SCHEDULE" = "schedule" ] && [ "$UTC_DAY" = "01" ]; then
-            echo "::notice::Monthly forced commit"
-            # 验证文件生成成功
-            if git diff --cached --quiet; then
-              echo "::error::No files generated"
-              git status --porcelain
-              exit 1
-            fi
-            git commit -m "Monthly forced update: Telegram IP routes"
-            git push origin "HEAD:main"
+- 路由条目: ${ROUTE_COUNT}
+- 地址列表: ${ADDR_COUNT}
+- 强制提交以保持仓库活跃"
+            
+            echo "::notice::🚀 月度保活提交已创建"
           else
-            echo "::notice::Daily conditional commit"
+            # 常规模式：有变更才提交
             if git diff --cached --quiet; then
-              echo "::notice::No changes, skip commit"
-            else
-              git commit -m "Automatic update: Telegram IP routes"
-              git push origin "HEAD:main"
+              echo "::notice::ℹ️ 无变更需要提交"
+              exit 0
             fi
-          fi
+            
+            git commit -m "chore: 更新 Telegram IP 路由 [${COMMIT_DATE}]
 
-      - name: Verify remote branch (debug)
+- 路由条目: ${ROUTE_COUNT}
+- 地址列表: ${ADDR_COUNT}"
+            
+            echo "::notice::✅ 变更已提交"
+          fi
+          
+          # 推送到主分支
+          git push origin HEAD:main
+          echo "::notice::📤 推送完成"
+
+      - name: 验证结果
+        if: always()
         run: |
-          set -x
-          # 验证远程状态
-          git ls-remote origin refs/heads/main || true
-          git fetch origin main --depth=1 || true
-          git --no-pager log -1 --pretty=fuller origin/main || true
+          echo "::group::📋 仓库状态"
+          git status --short --branch
+          echo "::endgroup::"
+          
+          echo "::group::📝 最新提交"
+          git --no-pager log -1 --oneline --stat
+          echo "::endgroup::"
+          
+          if [ -f "routeros-telegram-routes.rsc" ] && [ -f "routeros-telegram-addresslist.rsc" ]; then
+            ROUTE_COUNT=$(grep -c 'add comment=' routeros-telegram-routes.rsc || echo 0)
+            ADDR_COUNT=$(grep -c 'add list=' routeros-telegram-addresslist.rsc || echo 0)
+            echo "::notice::✅ 文件验证通过 | 路由: ${ROUTE_COUNT} | 地址列表: ${ADDR_COUNT}"
+          else
+            echo "::error::❌ 文件不存在"
+            exit 1
+          fi
