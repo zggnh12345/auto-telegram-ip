@@ -40,6 +40,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 检查是否首次运行
+          if [ ! -f "routeros-telegram-routes.rsc" ]; then
+            echo "::notice::🆕 检测到首次运行，将创建初始文件"
+          fi
+
           # 验证脚本存在
           if [ ! -f "./generate-telegram-routes.sh" ]; then
             echo "::error::脚本不存在"
@@ -96,7 +101,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 使用 git add -A 处理所有变更（新增/修改/删除）
+          # 精确暂存目标文件
           git add -A routeros-telegram-routes.rsc routeros-telegram-addresslist.rsc
           
           # 从前一步骤获取统计数据（避免重复计算）
