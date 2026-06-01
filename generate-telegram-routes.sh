@@ -31,7 +31,7 @@ echo "$IP_LIST" | grep ':' > iplist6.txt
   while read -r ip; do
     [[ -z "$ip" ]] && continue
     COUNT4=$((COUNT4 + 1))
-    echo "add comment=ipv4-telegram-${COUNT4} disabled=no distance=1 dst-address=${ip} gateway=${GATEWAY4} routing-table=${TABLE} scope=30 target-scope=10"
+    echo "add comment=telegram_ipv4_${COUNT4} disabled=no distance=1 dst-address=${ip} gateway=${GATEWAY4} routing-table=${TABLE} scope=30 target-scope=10"
   done < iplist4.txt
 
   echo ""
@@ -41,7 +41,7 @@ echo "$IP_LIST" | grep ':' > iplist6.txt
   while read -r ip6; do
     [[ -z "$ip6" ]] && continue
     COUNT6=$((COUNT6 + 1))
-    echo "add comment=ipv6-telegram-${COUNT6} disabled=no distance=1 dst-address=${ip6} gateway=${GATEWAY6} routing-table=${TABLE} scope=30 target-scope=10"
+    echo "add comment=telegram_ipv6_${COUNT6} disabled=no distance=1 dst-address=${ip6} gateway=${GATEWAY6} routing-table=${TABLE} scope=30 target-scope=10"
   done < iplist6.txt
 } > "$OUT_ROUTE_FILE"
 
@@ -55,7 +55,7 @@ echo "$IP_LIST" | grep ':' > iplist6.txt
   while read -r ip; do
     [[ -z "$ip" ]] && continue
     COUNT4=$((COUNT4 + 1))
-    echo "add list=proxy_ipv4 address=${ip} comment=\"ipv4-telegram-${COUNT4}\""
+    echo "add list=proxy_ipv4 address=${ip} comment=\"telegram_ipv4_${COUNT4}\""
   done < iplist4.txt
 
   echo ""
@@ -65,7 +65,7 @@ echo "$IP_LIST" | grep ':' > iplist6.txt
   while read -r ip6; do
     [[ -z "$ip6" ]] && continue
     COUNT6=$((COUNT6 + 1))
-    echo "add list=proxy_ipv6 address=${ip6} comment=\"ipv6-telegram-${COUNT6}\""
+    echo "add list=proxy_ipv6 address=${ip6} comment=\"telegram_ipv6_${COUNT6}\""
   done < iplist6.txt
 } > "$OUT_ADDRLIST_FILE"
 
